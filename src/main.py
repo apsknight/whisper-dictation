@@ -10,8 +10,14 @@ import subprocess
 import rumps
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
-import faster_whisper
+import boto3
+import json
+import base64
 import signal
+
+# Load configuration from config.env if it exists
+from load_config import load_config
+load_config()
 
 # Set up a global flag for handling SIGINT
 exit_flag = False
@@ -46,10 +52,11 @@ class WhisperDictationApp(rumps.App):
         self.frames = []
         self.keyboard_controller = Controller()
         
-        # Initialize Whisper model
-        self.model = None
-        self.load_model_thread = threading.Thread(target=self.load_model)
-        self.load_model_thread.start()
+        # Initialize SageMaker client
+        self.sagemaker_client = None
+        self.endpoint_name = os.getenv('WHISPER_ENDPOINT_NAME', 'whisper-inference')
+        self.region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', 'us-west-2'))
+        self.load_sagemaker_client()
         
         # Audio recording parameters
         self.format = pyaudio.paInt16
@@ -68,6 +75,7 @@ class WhisperDictationApp(rumps.App):
         print("You may need to grant this app accessibility permissions in System Preferences.")
         print("Go to System Preferences → Security & Privacy → Privacy → Accessibility")
         print("and add your terminal or the built app to the list.")
+        print(f"Using SageMaker endpoint: {self.endpoint_name} in region: {self.region}")
         
         # Start a watchdog thread to check for exit flag
         self.watchdog = threading.Thread(target=self.check_exit_flag, daemon=True)
@@ -100,18 +108,20 @@ class WhisperDictationApp(rumps.App):
             except:
                 pass
     
-    def load_model(self):
-        self.title = "🎙️ (Loading...)"
-        self.status_item.title = "Status: Loading Whisper model..."
+    def load_sagemaker_client(self):
+        """Initialize SageMaker runtime client"""
+        self.title = "🎙️ (Connecting...)"
+        self.status_item.title = "Status: Connecting to SageMaker..."
         try:
-            self.model = faster_whisper.WhisperModel("small.en")
+            self.sagemaker_client = boto3.client('sagemaker-runtime', region_name=self.region)
             self.title = "🎙️"
             self.status_item.title = "Status: Ready"
-            print("Whisper model loaded successfully!")
+            print("SageMaker client initialized successfully!")
         except Exception as e:
             self.title = "🎙️ (Error)"
-            self.status_item.title = "Status: Error loading model"
-            print(f"Error loading model: {e}")
+            self.status_item.title = "Status: Error connecting to SageMaker"
+            print(f"Error initializing SageMaker client: {e}")
+            print("Please ensure your AWS credentials are configured correctly.")
     
     def setup_global_monitor(self):
         # Create a separate thread to monitor for global key events
@@ -161,9 +171,9 @@ class WhisperDictationApp(rumps.App):
             sender.title = "Start Recording"
     
     def start_recording(self):
-        if not hasattr(self, 'model') or self.model is None:
-            print("Model not loaded. Please wait for the model to finish loading.")
-            self.status_item.title = "Status: Waiting for model to load"
+        if not hasattr(self, 'sagemaker_client') or self.sagemaker_client is None:
+            print("SageMaker client not initialized. Please check your AWS configuration.")
+            self.status_item.title = "Status: SageMaker client not ready"
             return
             
         self.frames = []
@@ -235,15 +245,43 @@ class WhisperDictationApp(rumps.App):
             wf.setframerate(self.rate)
             wf.writeframes(b''.join(self.frames))
         
-        print(f"Audio saved to temporary file. Transcribing...")
+        print(f"Audio saved to temporary file. Transcribing with SageMaker endpoint...")
         
-        # Transcribe with Whisper
+        # Transcribe with SageMaker endpoint
         try:
-            segments, info = self.model.transcribe(temp_filename, beam_size=5)
+            # Read the audio file and encode it as hexadecimal
+            with open(temp_filename, 'rb') as audio_file:
+                audio_data = audio_file.read()
+                audio_hex = audio_data.hex()
             
-            text = ""
-            for segment in segments:
-                text += segment.text
+            # Prepare the payload for SageMaker endpoint
+            payload = {
+                "audio_input": audio_hex,
+                "language": "english",
+                "task": "transcribe"
+            }
+            
+            # Call SageMaker endpoint
+            response = self.sagemaker_client.invoke_endpoint(
+                EndpointName=self.endpoint_name,
+                ContentType='application/json',
+                Body=json.dumps(payload)
+            )
+            
+            # Parse the response
+            result = json.loads(response['Body'].read().decode())
+            
+            # Extract text from response - the 'text' field contains a list
+            if isinstance(result, dict) and 'text' in result:
+                text_list = result['text']
+                if isinstance(text_list, list) and len(text_list) > 0:
+                    text = str(text_list[0]).strip()
+                else:
+                    text = str(text_list).strip()
+            elif isinstance(result, str):
+                text = result.strip()
+            else:
+                text = str(result).strip()
             
             if text:
                 # Insert text at cursor position
@@ -253,8 +291,9 @@ class WhisperDictationApp(rumps.App):
             else:
                 print("No speech detected")
                 self.status_item.title = "Status: No speech detected"
+                
         except Exception as e:
-            print(f"Transcription error: {e}")
+            print(f"SageMaker transcription error: {e}")
             self.status_item.title = "Status: Transcription error"
             raise
         finally:

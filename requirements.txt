@@ -1,7 +1,7 @@
 pyaudio
 pynput
 numpy
-faster-whisper
+boto3
 rumps
 pyobjc
 py2app

@@ -2,32 +2,98 @@
 
 **Note: This application is for macOS only.**
 
-A macOS application that converts speech to text using OpenAI's Whisper model running locally. Press the Globe/Function key to start recording, press it again to stop recording, transcribe, and paste text at your current cursor position.
+A macOS application that converts speech to text using OpenAI's Whisper Large V3 Turbo model deployed on Amazon SageMaker. Press the Globe/Function key to start recording, press it again to stop recording, transcribe, and paste text at your current cursor position.
 
 ## Features
 
 - System tray (menu bar) application that runs in the background
 - Global hotkey (Globe/Function key) to trigger dictation
-- Transcribes speech to text using OpenAI's Whisper model locally
+- Transcribes speech to text using OpenAI's Whisper Large V3 Turbo model on Amazon SageMaker
 - Automatically pastes transcribed text at your cursor position
 - Visual feedback with menu bar icon status
+- High-quality transcription with powerful cloud-based inference
 
 ## Setup and Installation
 
+### Prerequisites
+
+1. **AWS Account**: You need an AWS account with appropriate permissions for SageMaker and Bedrock.
+2. **AWS CLI**: Install and configure AWS CLI with your credentials:
+   ```bash
+   aws configure
+   ```
+
+### Step 1: Deploy Whisper Large V3 Turbo on SageMaker
+
+1. **Access Amazon Bedrock Model Catalog**:
+   - Go to the [AWS Console](https://console.aws.amazon.com/)
+   - Navigate to **Amazon Bedrock** service
+   - Click on **Model catalog** in the left sidebar
+
+2. **Find Whisper Large V3 Turbo**:
+   - Search for "Whisper Large V3 Turbo" in the model catalog
+   - Select the model from the search results
+
+3. **Deploy to SageMaker Endpoint**:
+   - Click **"Deploy to SageMaker endpoint"**
+   - Configure the deployment:
+     - **Endpoint name**: `whisper-inference` (or your preferred name)
+     - **Instance type**: `ml.g5.2xlarge` (recommended for optimal performance)
+     - **Instance count**: `1`
+   - Click **"Deploy"** and wait for the endpoint to be in "InService" status (this may take 5-10 minutes)
+
+4. **Note your endpoint details**:
+   - Endpoint name: e.g., `whisper-inference`
+   - Region: Note the AWS region where you deployed (e.g., `us-west-2`)
+
+### Step 2: Configure the Application
+
+1. **Create configuration file**:
+   ```bash
+   cp src/config.env.example config.env
+   ```
+
+2. **Edit `config.env`** with your endpoint details:
+   ```bash
+   # Whisper Dictation Configuration
+   WHISPER_ENDPOINT_NAME=your-endpoint-name
+   AWS_REGION=your-aws-region
+   
+   # Optional: AWS Profile (if not using default)
+   # AWS_PROFILE=your-profile-name
+   ```
+
+   **Alternative**: You can also set these as environment variables:
+   ```bash
+   export WHISPER_ENDPOINT_NAME=your-endpoint-name
+   export AWS_REGION=your-aws-region
+   ```
+
+3. **Install Python dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Install PortAudio** (required for PyAudio):
+   ```bash
+   brew install portaudio
+   ```
+
+### Step 3: AWS Permissions
+
+Ensure your AWS credentials have the following permissions:
+- `sagemaker:InvokeEndpoint` for your Whisper endpoint
+- Access to the specific SageMaker endpoint ARN
+
+You can test your endpoint access with:
+```bash
+aws sagemaker list-endpoints --region your-aws-region
+```
+
 ### Development Setup
 
-1. Install Python dependencies:
-```
-pip install -r requirements.txt
-```
-
-2. Install PortAudio (required for PyAudio):
-```
-brew install portaudio
-```
-
-3. Run the application in development mode:
-```
+Run the application in development mode:
+```bash
 python src/main.py
 ```
 
@@ -75,6 +141,24 @@ The app requires the following permissions:
 
 ## Troubleshooting
 
+### Configuration Issues
+
+1. **Check your endpoint configuration**:
+   ```bash
+   # Verify your endpoint exists and is in service
+   aws sagemaker describe-endpoint --endpoint-name your-endpoint-name --region your-aws-region
+   ```
+
+2. **Test AWS credentials**:
+   ```bash
+   aws sts get-caller-identity
+   ```
+
+3. **Debug configuration loading**:
+   The app will print the endpoint name and region it's using when it starts. Check the console output.
+
+### General Issues
+
 If something goes wrong or you need to stop the background process, you can kill it by running one of the following commands in your Terminal:
 
 1. List the running process(es):
@@ -85,3 +169,9 @@ ps aux | grep 'src/main.py'
 ```
 kill -9 <PID>
 ```
+
+### Common Error Messages
+
+- **"SageMaker client not initialized"**: Check your AWS credentials and region configuration
+- **"ModelError when calling InvokeEndpoint"**: Verify your endpoint name and that it's in "InService" status
+- **"AccessDenied"**: Ensure your AWS credentials have `sagemaker:InvokeEndpoint` permissions
