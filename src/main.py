@@ -13,6 +13,7 @@ import faster_whisper
 import signal
 from text_selection import TextSelection
 from bedrock_client import BedrockClient
+from recording_indicator import RecordingIndicator
 from logger_config import setup_logging
 
 logger = setup_logging()
@@ -54,7 +55,11 @@ class WhisperDictationApp(rumps.App):
         
         # Initialize Bedrock client
         self.bedrock_client = BedrockClient()
-        
+
+        # Initialize recording indicator
+        self.indicator = RecordingIndicator()
+        self.indicator.set_app_reference(self)
+
         # Initialize Whisper model
         self.model = None
         self.load_model_thread = threading.Thread(target=self.load_model)
@@ -119,7 +124,7 @@ class WhisperDictationApp(rumps.App):
         self.title = "🎙️ (Loading...)"
         self.status_item.title = "Status: Loading Whisper model..."
         try:
-            self.model = faster_whisper.WhisperModel("small.en")
+            self.model = faster_whisper.WhisperModel("medium.en")
             self.title = "🎙️"
             self.status_item.title = "Status: Ready"
             logger.info("Whisper model loaded successfully!")
@@ -180,15 +185,18 @@ class WhisperDictationApp(rumps.App):
             logger.warning("Model not loaded. Please wait for the model to finish loading.")
             self.status_item.title = "Status: Waiting for model to load"
             return
-            
+
         self.frames = []
         self.recording = True
-        
+
         # Update UI
         self.title = "🎙️ (Recording)"
         self.status_item.title = "Status: Recording..."
         logger.info("Recording started. Speak now...")
-        
+
+        # Show recording indicator
+        self.indicator.start()
+
         # Start recording thread
         self.recording_thread = threading.Thread(target=self.record_audio)
         self.recording_thread.start()
@@ -197,12 +205,15 @@ class WhisperDictationApp(rumps.App):
         self.recording = False
         if hasattr(self, 'recording_thread'):
             self.recording_thread.join()
-        
+
+        # Hide recording indicator
+        self.indicator.stop()
+
         # Update UI
         self.title = "🎙️ (Transcribing)"
         self.status_item.title = "Status: Transcribing..."
         logger.info("Recording stopped. Transcribing...")
-        
+
         # Process in background
         transcribe_thread = threading.Thread(target=self.process_recording)
         transcribe_thread.start()
@@ -225,11 +236,14 @@ class WhisperDictationApp(rumps.App):
             input=True,
             frames_per_buffer=self.chunk
         )
-        
+
         while self.recording:
             data = stream.read(self.chunk)
             self.frames.append(data)
-            
+
+            # Update indicator with audio level
+            self.indicator.update_audio_level(data)
+
         stream.stop_stream()
         stream.close()
     
