@@ -42,13 +42,22 @@ class WhisperDictationApp(rumps.App):
         
         # Add menu items - use a single menu item for toggling recording
         self.recording_menu_item = rumps.MenuItem("Start Recording")
-        self.menu = [self.recording_menu_item, None, self.status_item]
-        
+
         # Recording state
         self.recording = False
         self.audio = pyaudio.PyAudio()
         self.frames = []
         self.keyboard_controller = Controller()
+
+        # Microphone selection (None = use default)
+        self.selected_input_device = None
+
+        # Create microphone selection submenu
+        self.mic_menu = {}
+        self.mic_menu_mapping = {}  # Maps menu title to device index
+        self.setup_microphone_menu()
+
+        self.menu = [self.recording_menu_item, self.mic_submenu, None, self.status_item]
         
         # Initialize text selection handler
         self.text_selector = TextSelection()
@@ -73,11 +82,18 @@ class WhisperDictationApp(rumps.App):
         
         # Hotkey configuration - we'll listen for globe/fn key (vk=63)
         self.trigger_key = 63  # Key code for globe/fn key
+
+        # Right Shift trigger state (optimistic recording with discard threshold)
+        self.shift_press_time = None
+        self.shift_held = False
+        self.shift_threshold = 0.75  # Minimum hold time in seconds
+
         self.setup_global_monitor()
         
         # Show initial message
         logger.info("Started WhisperDictation app. Look for 🎙️ in your menu bar.")
         logger.info("Press and hold the Globe/Fn key (vk=63) to record. Release to transcribe.")
+        logger.info("Alternatively, hold Right Shift to record (release after 0.75s to process, before to discard).")
         logger.info("Press Ctrl+C to quit the application.")
         logger.info("You may need to grant this app accessibility permissions in System Preferences.")
         logger.info("Go to System Preferences → Security & Privacy → Privacy → Accessibility")
@@ -133,20 +149,92 @@ class WhisperDictationApp(rumps.App):
             self.status_item.title = "Status: Error loading model"
             logger.error(f"Error loading model: {e}")
     
+    def setup_microphone_menu(self):
+        """Setup the microphone selection submenu"""
+        self.mic_submenu = rumps.MenuItem("Microphone")
+        devices = self.get_input_devices()
+
+        for device in devices:
+            title = device['name']
+            if device['is_default']:
+                title += " (Default)"
+
+            menu_item = rumps.MenuItem(title, callback=self.select_microphone)
+            # Mark the default device as selected initially
+            if device['is_default']:
+                menu_item.state = True
+
+            self.mic_menu[title] = menu_item
+            self.mic_menu_mapping[title] = device['index']
+            self.mic_submenu.add(menu_item)
+
     def setup_global_monitor(self):
         # Create a separate thread to monitor for global key events
         self.key_monitor_thread = threading.Thread(target=self.monitor_keys)
         self.key_monitor_thread.daemon = True
         self.key_monitor_thread.start()
+
+    def get_input_devices(self):
+        """Get list of available audio input devices"""
+        devices = []
+        default_index = self.audio.get_default_input_device_info()['index']
+        for i in range(self.audio.get_device_count()):
+            info = self.audio.get_device_info_by_index(i)
+            if info['maxInputChannels'] > 0:
+                devices.append({
+                    'index': info['index'],
+                    'name': info['name'],
+                    'is_default': info['index'] == default_index
+                })
+        return devices
+
+    def select_microphone(self, sender):
+        """Callback when a microphone is selected from the menu"""
+        # Uncheck all items in the microphone menu
+        for item in self.mic_menu.values():
+            item.state = False
+        # Check the selected item
+        sender.state = True
+        # Store the device index (stored in the menu item's title parsing or we use a mapping)
+        device_index = self.mic_menu_mapping.get(sender.title)
+        self.selected_input_device = device_index
+        device_name = sender.title.replace(" (Default)", "")
+        logger.info(f"Microphone changed to: {device_name}")
+
+    def discard_recording(self):
+        """Discard current recording without processing (held too short)"""
+        self.recording = False
+        if hasattr(self, 'recording_thread') and self.recording_thread.is_alive():
+            self.recording_thread.join(timeout=0.5)
+        self.frames = []
+        self.indicator.stop()
+        self.title = "🎙️"
+        self.status_item.title = "Status: Recording discarded (too short)"
+        logger.info("Recording discarded - held for less than threshold")
     
     def monitor_keys(self):
         # Track state of key 63 (Globe/Fn key)
         self.is_recording_with_key63 = False
         
         def on_press(key):
+            # If Right Shift is held and another key is pressed, cancel recording (user is typing)
+            if self.shift_held and key != Key.shift_r:
+                logger.info("Other key pressed while Right Shift held - canceling recording")
+                self.shift_held = False
+                self.discard_recording()
+                return
+
             # Removed logging for every key press; log only when target key is pressed
             if hasattr(key, 'vk') and key.vk == self.trigger_key:
                 logger.debug(f"Target key (vk={key.vk}) pressed")
+
+            # Right Shift handling - start recording immediately (optimistic)
+            if key == Key.shift_r:
+                if not self.recording:
+                    logger.info("Right Shift pressed - starting recording immediately")
+                    self.shift_press_time = time.time()
+                    self.shift_held = True
+                    self.start_recording()
         
         def on_release(key):
             if hasattr(key, 'vk'):
@@ -160,6 +248,18 @@ class WhisperDictationApp(rumps.App):
                         logger.debug(f"Globe/Fn key (vk={key.vk}) released - STOPPING recording")
                         self.is_recording_with_key63 = False
                         self.stop_recording()
+
+            # Right Shift handling - check duration and discard or process
+            if key == Key.shift_r and self.shift_held:
+                hold_duration = time.time() - self.shift_press_time
+                self.shift_held = False
+
+                if hold_duration < self.shift_threshold:
+                    logger.info(f"Right Shift released after {hold_duration:.2f}s - discarding (< {self.shift_threshold}s)")
+                    self.discard_recording()
+                else:
+                    logger.info(f"Right Shift released after {hold_duration:.2f}s - processing")
+                    self.stop_recording()
         
         try:
             with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
@@ -229,13 +329,19 @@ class WhisperDictationApp(rumps.App):
             self.title = "🎙️"  # Reset title
     
     def record_audio(self):
-        stream = self.audio.open(
-            format=self.format,
-            channels=self.channels,
-            rate=self.rate,
-            input=True,
-            frames_per_buffer=self.chunk
-        )
+        # Build kwargs for audio stream
+        stream_kwargs = {
+            'format': self.format,
+            'channels': self.channels,
+            'rate': self.rate,
+            'input': True,
+            'frames_per_buffer': self.chunk
+        }
+        # Use selected input device if specified
+        if self.selected_input_device is not None:
+            stream_kwargs['input_device_index'] = self.selected_input_device
+
+        stream = self.audio.open(**stream_kwargs)
 
         while self.recording:
             data = stream.read(self.chunk)
@@ -275,24 +381,24 @@ class WhisperDictationApp(rumps.App):
                 text += segment.text
             
             if text:
-                #  What does this look like?
+                # Check for selected text to potentially enhance
                 selected_text = self.text_selector.get_selected_text()
                 logger.debug(f"Selected text: {selected_text}")
-                
+
                 if selected_text and self.bedrock_client.is_available():
                     logger.info(f"Selected text detected: {selected_text[:50]}...")
                     logger.info(f"Voice instruction: {text}")
-                    
+
                     try:
                         # Use Bedrock to enhance the selected text
                         self.status_item.title = "Status: Enhancing text with AI..."
                         enhanced_text = self.bedrock_client.enhance_text(text, selected_text)
-                        
+
                         # Replace selected text with enhanced version
                         self.text_selector.replace_selected_text(enhanced_text)
                         logger.info(f"Enhanced text: {enhanced_text}")
                         self.status_item.title = f"Status: Enhanced: {enhanced_text[:30]}..."
-                        
+
                     except Exception as e:
                         logger.error(f"Error enhancing text: {e}")
                         # Fallback to normal text insertion
