@@ -13,9 +13,13 @@ import faster_whisper
 import signal
 from text_selection import TextSelection
 from bedrock_client import BedrockClient
+from sagemaker_client import SageMakerClient
 from recording_indicator import RecordingIndicator
 from logger_config import setup_logging
+from dotenv import load_dotenv
 
+# Load environment variables
+load_dotenv()
 logger = setup_logging()
 
 # Set up a global flag for handling SIGINT
@@ -69,8 +73,18 @@ class WhisperDictationApp(rumps.App):
         self.indicator = RecordingIndicator()
         self.indicator.set_app_reference(self)
 
-        # Initialize Whisper model
+        # Initialize inference mode and clients
+        self.inference_mode = os.getenv('WHISPER_INFERENCE_MODE', 'local').lower()
         self.model = None
+        self.sagemaker_client = None
+        
+        if self.inference_mode == 'sagemaker':
+            self.sagemaker_client = SageMakerClient()
+            logger.info("Using SageMaker inference mode")
+        else:
+            self.inference_mode = 'local'  # Default to local if invalid mode
+            logger.info("Using local inference mode")
+            
         self.load_model_thread = threading.Thread(target=self.load_model)
         self.load_model_thread.start()
         
@@ -92,6 +106,7 @@ class WhisperDictationApp(rumps.App):
         
         # Show initial message
         logger.info("Started WhisperDictation app. Look for 🎙️ in your menu bar.")
+        logger.info(f"Inference mode: {self.inference_mode.upper()}")
         logger.info("Press and hold the Globe/Fn key (vk=63) to record. Release to transcribe.")
         logger.info("Alternatively, hold Right Shift to record (release after 0.75s to process, before to discard).")
         logger.info("Press Ctrl+C to quit the application.")
@@ -137,17 +152,40 @@ class WhisperDictationApp(rumps.App):
                 pass
     
     def load_model(self):
-        self.title = "🎙️ (Loading...)"
-        self.status_item.title = "Status: Loading Whisper model..."
-        try:
-            self.model = faster_whisper.WhisperModel("medium.en")
-            self.title = "🎙️"
-            self.status_item.title = "Status: Ready"
-            logger.info("Whisper model loaded successfully!")
-        except Exception as e:
-            self.title = "🎙️ (Error)"
-            self.status_item.title = "Status: Error loading model"
-            logger.error(f"Error loading model: {e}")
+        if self.inference_mode == 'sagemaker':
+            self.title = "🎙️ (Connecting...)"
+            self.status_item.title = "Status: Connecting to SageMaker..."
+            try:
+                if self.sagemaker_client and self.sagemaker_client.is_available():
+                    success, message = self.sagemaker_client.test_connection()
+                    if success:
+                        self.title = "🎙️"
+                        self.status_item.title = "Status: Ready (SageMaker)"
+                        logger.info(f"SageMaker endpoint ready: {message}")
+                    else:
+                        self.title = "🎙️ (Error)"
+                        self.status_item.title = "Status: SageMaker connection failed"
+                        logger.error(f"SageMaker connection failed: {message}")
+                else:
+                    self.title = "🎙️ (Error)"
+                    self.status_item.title = "Status: SageMaker client not initialized"
+                    logger.error("SageMaker client not initialized")
+            except Exception as e:
+                self.title = "🎙️ (Error)"
+                self.status_item.title = "Status: SageMaker error"
+                logger.error(f"SageMaker error: {e}")
+        else:
+            self.title = "🎙️ (Loading...)"
+            self.status_item.title = "Status: Loading Whisper model..."
+            try:
+                self.model = faster_whisper.WhisperModel("medium.en")
+                self.title = "🎙️"
+                self.status_item.title = "Status: Ready (Local)"
+                logger.info("Whisper model loaded successfully!")
+            except Exception as e:
+                self.title = "🎙️ (Error)"
+                self.status_item.title = "Status: Error loading model"
+                logger.error(f"Error loading model: {e}")
     
     def setup_microphone_menu(self):
         """Setup the microphone selection submenu"""
@@ -372,13 +410,19 @@ class WhisperDictationApp(rumps.App):
         
         logger.debug("Audio saved to temporary file. Transcribing...")
         
-        # Transcribe with Whisper
+        # Transcribe with either local Whisper or SageMaker
         try:
-            segments, _ = self.model.transcribe(temp_filename, beam_size=5)
-            
-            text = ""
-            for segment in segments:
-                text += segment.text
+            if self.inference_mode == 'sagemaker':
+                if not self.sagemaker_client or not self.sagemaker_client.is_available():
+                    raise Exception("SageMaker client not available")
+                text = self.sagemaker_client.transcribe_audio(temp_filename)
+            else:
+                if not self.model:
+                    raise Exception("Local Whisper model not loaded")
+                segments, _ = self.model.transcribe(temp_filename, beam_size=5)
+                text = ""
+                for segment in segments:
+                    text += segment.text
             
             if text:
                 # Check for selected text to potentially enhance
